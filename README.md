@@ -1,6 +1,6 @@
 # SMC BOS Strategy
 
-A Pine Script backtesting framework for testing a Smart Money Concepts trading model.
+A Pine Script backtesting framework for testing a trading model.
 
 ## Strategy Concept
 
