@@ -1,0 +1,266 @@
+strategy("HTF Bias + Sweep + 1-of-3 Confluence (OB/FVG/EQ) + LTF BOS Entry [Backtest]",
+     overlay=true,
+     initial_capital=10000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.01,
+     slippage=1,
+     pyramiding=0,
+     calc_on_every_tick=false,
+     process_orders_on_close=true)
+
+// Inputs
+biasTF       = input.timeframe("240", "Bias TF (4H)")
+trendTF      = input.timeframe("60",  "Trend TF (1H)")
+leftRight    = input.int(3, "Swing strength (pivot L/R)", minval=1, maxval=20)
+
+emaLenBias   = input.int(200, "Bias EMA length", minval=10, maxval=500)
+emaLenTrend  = input.int(200, "Trend EMA length", minval=10, maxval=500)
+
+requireSweep = input.bool(true, "Require HTF liquidity sweep")
+sweepTF      = input.string("AUTO", "Sweep TF", options=["AUTO","4H","1H"])
+
+rr = input.float(2.0, "Take Profit (R multiple)", minval=0.5, step=0.25)
+useOBTouch = input.bool(true, "Allow OB as 3rd confluence")
+useFVGTouch = input.bool(true, "Allow FVG as 3rd confluence")
+useEQTouch = input.bool(true, "Allow EQ as 3rd confluence")
+
+eqTolTicks   = input.int(10, "EQ tolerance (ticks)", minval=1)
+eqTol = eqTolTicks * syminfo.mintick
+
+showOBBoxes  = input.bool(true, "Draw OB box")
+showFVGBoxes = input.bool(false, "Draw FVG box (optional)")
+showLabels   = input.bool(true, "Show entry labels")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: last confirmed pivot levels on a TF (returns last PH/PL values)
+// ─────────────────────────────────────────────────────────────────────────────
+f_last_confirmed_pivot_levels(_tf, _lr) =>
+    phTF = request.security(syminfo.tickerid, _tf, ta.pivothigh(high, _lr, _lr))
+    plTF = request.security(syminfo.tickerid, _tf, ta.pivotlow(low,  _lr, _lr))
+    lastPH = ta.valuewhen(not na(phTF), phTF, 0)
+    lastPL = ta.valuewhen(not na(plTF), plTF, 0)
+    [lastPH, lastPL]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTF Bias (4H) and Trend (1H) via EMA
+// ─────────────────────────────────────────────────────────────────────────────
+biasClose = request.security(syminfo.tickerid, biasTF, close)
+biasEma   = request.security(syminfo.tickerid, biasTF, ta.ema(close, emaLenBias))
+biasBull  = biasClose > biasEma
+biasBear  = biasClose < biasEma
+
+trendClose = request.security(syminfo.tickerid, trendTF, close)
+trendEma   = request.security(syminfo.tickerid, trendTF, ta.ema(close, emaLenTrend))
+trendBull  = trendClose > trendEma
+trendBear  = trendClose < trendEma
+
+alignedBull = biasBull and trendBull
+alignedBear = biasBear and trendBear
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTF Liquidity Sweep (optional) on chosen TF
+// ─────────────────────────────────────────────────────────────────────────────
+useSweepTF = sweepTF == "AUTO" ? ((alignedBull or alignedBear) ? "60" : "240") : (sweepTF == "4H" ? "240" : "60")
+
+[sweepPH, sweepPL] = f_last_confirmed_pivot_levels(useSweepTF, leftRight)
+
+sH = request.security(syminfo.tickerid, useSweepTF, high)
+sL = request.security(syminfo.tickerid, useSweepTF, low)
+sC = request.security(syminfo.tickerid, useSweepTF, close)
+
+// Sweep definition: wick through pivot, close back inside
+sweepHigh = not na(sweepPH) and sH > sweepPH and sC < sweepPH
+sweepLow  = not na(sweepPL) and sL < sweepPL and sC > sweepPL
+
+sweepOkBull = requireSweep ? sweepLow  : true
+sweepOkBear = requireSweep ? sweepHigh : true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BOS on current chart TF (structure break via pivots)
+// ─────────────────────────────────────────────────────────────────────────────
+ph = ta.pivothigh(high, leftRight, leftRight)
+pl = ta.pivotlow(low,  leftRight, leftRight)
+lastPH = ta.valuewhen(not na(ph), ph, 0)
+lastPL = ta.valuewhen(not na(pl), pl, 0)
+
+bosUp = not na(lastPH) and close > lastPH
+bosDn = not na(lastPL) and close < lastPL
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Order Block (proxy): last opposite candle before BOS on current TF
+// ─────────────────────────────────────────────────────────────────────────────
+f_find_last_bearish_candle() =>
+    int idx = na
+    for i = 1 to 15
+        if close[i] < open[i]
+            idx := i
+            break
+    idx
+
+f_find_last_bullish_candle() =>
+    int idx = na
+    for i = 1 to 15
+        if close[i] > open[i]
+            idx := i
+            break
+    idx
+
+var float obHi = na
+var float obLo = na
+var int   obDir = 0        // +1 bullish, -1 bearish
+var box   obBox = na
+
+// Create OB only when BOS happens (keeps the “latest actionable zone”)
+if bosUp
+    i = f_find_last_bearish_candle()
+    if not na(i)
+        obHi := high[i]
+        obLo := low[i]
+        obDir := +1
+
+if bosDn
+    i = f_find_last_bullish_candle()
+    if not na(i)
+        obHi := high[i]
+        obLo := low[i]
+        obDir := -1
+
+inOB = obDir != 0 and close <= obHi and close >= obLo
+hitOB = useOBTouch ? inOB : false
+
+if showOBBoxes and obDir != 0
+    if not na(obBox)
+        box.delete(obBox)
+    obBox := box.new(bar_index - 1, obHi, bar_index, obLo, extend=extend.right,
+         border_width=1, border_color=color.new(color.white, 0), bgcolor=color.new(color.blue, 70))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FVG (simple 3-candle imbalance) on current TF
+// Bull FVG: low > high[2]  (gap between high[2] and low)
+// Bear FVG: high < low[2]  (gap between high and low[2])
+// ─────────────────────────────────────────────────────────────────────────────
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+var float fvgHi = na
+var float fvgLo = na
+var int   fvgDir = 0
+var box   fvgBox = na
+
+if bullFVG
+    fvgHi := low
+    fvgLo := high[2]
+    fvgDir := +1
+
+if bearFVG
+    fvgHi := low[2]
+    fvgLo := high
+    fvgDir := -1
+
+inFVG = fvgDir != 0 and close <= fvgHi and close >= fvgLo
+hitFVG = useFVGTouch ? inFVG : false
+
+if showFVGBoxes and fvgDir != 0
+    if not na(fvgBox)
+        box.delete(fvgBox)
+    fvgBox := box.new(bar_index - 1, fvgHi, bar_index, fvgLo, extend=extend.right,
+         border_width=1, border_color=color.new(color.white, 0), bgcolor=color.new(color.purple, 80))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Equilibrium (EQ) = midpoint of last swing high/low on current TF
+// “Hit” when price is within tolerance
+// ─────────────────────────────────────────────────────────────────────────────
+swingHigh = ta.valuewhen(not na(ta.pivothigh(high, leftRight, leftRight)), ta.pivothigh(high, leftRight, leftRight), 0)
+swingLow  = ta.valuewhen(not na(ta.pivotlow(low,  leftRight, leftRight)),  ta.pivotlow(low,  leftRight, leftRight),  0)
+
+eqMid = (swingHigh + swingLow) / 2.0
+hitEQ = useEQTouch ? (not na(eqMid) and math.abs(close - eqMid) <= eqTol) : false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1-of-3 confluence rule
+// ─────────────────────────────────────────────────────────────────────────────
+hit3rdConfluence = (hitOB or hitFVG or hitEQ)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lower TF BOS confirmation (15m->5m, 5m->1m)
+// This does NOT change your chart. It just uses LTF BOS as the entry trigger.
+// ─────────────────────────────────────────────────────────────────────────────
+string entryTF = (timeframe.isminutes and timeframe.multiplier <= 5) ? "1" : "5"
+
+f_bos(_lr) =>
+    _ph = ta.pivothigh(high, _lr, _lr)
+    _pl = ta.pivotlow(low,  _lr, _lr)
+    _lastPH = ta.valuewhen(not na(_ph), _ph, 0)
+    _lastPL = ta.valuewhen(not na(_pl), _pl, 0)
+    _bosUp = not na(_lastPH) and close > _lastPH
+    _bosDn = not na(_lastPL) and close < _lastPL
+    [_bosUp, _bosDn]
+
+[bosUpEntryTF, bosDnEntryTF] = request.security(syminfo.tickerid, entryTF, f_bos(leftRight))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trade gates + entries
+// ─────────────────────────────────────────────────────────────────────────────
+longGate  = alignedBull and sweepOkBull and hit3rdConfluence
+shortGate = alignedBear and sweepOkBear and hit3rdConfluence
+
+// Entry occurs only when LTF BOS confirms
+longEntry  = longGate  and bosUpEntryTF
+shortEntry = shortGate and bosDnEntryTF
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stops / Targets (mechanical default)
+// Prefer OB edge if OB exists; otherwise use last swing low/high.
+// TP = rr * risk
+// ─────────────────────────────────────────────────────────────────────────────
+fallbackSL_Long  = swingLow
+fallbackSL_Short = swingHigh
+
+longSL  = (obDir == +1 and not na(obLo)) ? obLo : fallbackSL_Long
+shortSL = (obDir == -1 and not na(obHi)) ? obHi : fallbackSL_Short
+
+longRisk  = close - longSL
+shortRisk = shortSL - close
+
+validLong  = (not na(longSL))  and longRisk  > syminfo.mintick * 5
+validShort = (not na(shortSL)) and shortRisk > syminfo.mintick * 5
+
+longTP  = close + (longRisk  * rr)
+shortTP = close - (shortRisk * rr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Execute trades
+// ─────────────────────────────────────────────────────────────────────────────
+if longEntry and validLong and strategy.position_size == 0
+    strategy.entry("L", strategy.long)
+    strategy.exit("L-Exit", "L", stop=longSL, limit=longTP)
+
+if shortEntry and validShort and strategy.position_size == 0
+    strategy.entry("S", strategy.short)
+    strategy.exit("S-Exit", "S", stop=shortSL, limit=shortTP)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Visuals / labels
+// ─────────────────────────────────────────────────────────────────────────────
+plot(eqMid, "Equilibrium (mid)", color=color.new(color.yellow, 0))
+
+plotshape(showLabels and longEntry,  title="Long Entry",  style=shape.triangleup,   location=location.belowbar, size=size.tiny, text="L")
+plotshape(showLabels and shortEntry, title="Short Entry", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="S")
+
+if showLabels and (longEntry or shortEntry)
+    dir = longEntry ? "LONG" : "SHORT"
+    confTxt = hitOB ? "OB" : hitFVG ? "FVG" : "EQ"
+    txt = dir + "\n3rd: " + confTxt + "\nEntry BOS TF: " + entryTF
+    label.new(bar_index, longEntry ? low : high, txt, style=label.style_label_left,
+      textcolor=color.white, color=color.new(color.black, 0))
+
+// Helpful status (optional)
+var table t = table.new(position.top_right, 1, 1)
+status = "Bias(4H): " + (biasBull ? "Bull" : biasBear ? "Bear" : "Flat") +
+         "\nTrend(1H): " + (trendBull ? "Bull" : trendBear ? "Bear" : "Flat") +
+         "\nAligned: " + ((alignedBull or alignedBear) ? "YES" : "NO") +
+         "\nSweep OK: " + ((alignedBull ? sweepOkBull : alignedBear ? sweepOkBear : false) ? "YES" : "NO") +
+         "\n3rd hit: " + (hit3rdConfluence ? "YES" : "NO") +
+         "\nChart TF: " + timeframe.period +
+         "\nEntry TF: " + entryTF
+table.cell(t, 0, 0, status)
