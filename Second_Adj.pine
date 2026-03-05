@@ -1,0 +1,271 @@
+//@version=5
+strategy("SMC Prompt-Aligned Strat (4H/1H Bias + Sweep + BOS + 3rd Confluence + Pressure)",
+     overlay=true,
+     initial_capital=10000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.01,
+     slippage=1,
+     pyramiding=0,
+     calc_on_every_tick=false,
+     process_orders_on_close=true)
+
+// Inputs
+biasTF       = input.timeframe("240", "Bias TF (4H)")
+trendTF      = input.timeframe("60",  "Trend TF (1H)")
+leftRight    = input.int(3, "Swing strength (pivot L/R)", minval=1, maxval=20)
+
+emaLenBias   = input.int(200, "4H trend EMA length", minval=10, maxval=500)
+emaLenTrend  = input.int(200, "1H trend EMA length", minval=10, maxval=500)
+
+requireSweep = input.bool(true, "Require liquidity sweep")
+autoSweepTF  = input.bool(true, "Auto sweep TF (Aligned=>1H, Opposed=>4H)")
+manualSweepTF= input.string("1H", "Manual Sweep TF", options=["1H","4H"])
+
+rr = input.float(2.0, "Take Profit (R multiple)", minval=0.5, step=0.25)
+
+useOBTouch      = input.bool(true, "Allow OB as 3rd confluence")
+useFVGTouch     = input.bool(true, "Allow FVG as 3rd confluence")
+useBreakerTouch = input.bool(true, "Allow Breaker as 3rd confluence")
+useEQTouch      = input.bool(true, "Allow EQ as 3rd confluence")
+
+pressureBodyPct = input.float(0.55, "Pressure: min body/range", minval=0.1, maxval=1.0, step=0.05)
+pressureVolLen  = input.int(20, "Pressure: volume SMA length", minval=1)
+
+showOBBoxes      = input.bool(true, "Draw OB box")
+showFVGBoxes     = input.bool(false, "Draw FVG box")
+showBreakerBoxes = input.bool(true, "Draw breaker box")
+showLabels       = input.bool(true, "Show entry labels")
+
+// Helpers
+f_last_confirmed_pivot_levels(_tf, _lr) =>
+    phTF = request.security(syminfo.tickerid, _tf, ta.pivothigh(high, _lr, _lr))
+    plTF = request.security(syminfo.tickerid, _tf, ta.pivotlow(low,  _lr, _lr))
+    lastPH = ta.valuewhen(not na(phTF), phTF, 0)
+    lastPL = ta.valuewhen(not na(plTF), plTF, 0)
+    [lastPH, lastPL]
+
+f_bos(_lr) =>
+    _ph = ta.pivothigh(high, _lr, _lr)
+    _pl = ta.pivotlow(low,  _lr, _lr)
+    _lastPH = ta.valuewhen(not na(_ph), _ph, 0)
+    _lastPL = ta.valuewhen(not na(_pl), _pl, 0)
+    _bosUp = not na(_lastPH) and close > _lastPH
+    _bosDn = not na(_lastPL) and close < _lastPL
+    [_bosUp, _bosDn]
+
+f_find_last_bearish_candle() =>
+    int idx = na
+    for i = 1 to 15
+        if close[i] < open[i]
+            idx := i
+            break
+    idx
+
+f_find_last_bullish_candle() =>
+    int idx = na
+    for i = 1 to 15
+        if close[i] > open[i]
+            idx := i
+            break
+    idx
+
+// 1) Bias/trend from 4H + 1H
+biasClose = request.security(syminfo.tickerid, biasTF, close)
+biasEma   = request.security(syminfo.tickerid, biasTF, ta.ema(close, emaLenBias))
+biasBull  = biasClose > biasEma
+biasBear  = biasClose < biasEma
+
+trendClose = request.security(syminfo.tickerid, trendTF, close)
+trendEma   = request.security(syminfo.tickerid, trendTF, ta.ema(close, emaLenTrend))
+trendBull  = trendClose > trendEma
+trendBear  = trendClose < trendEma
+
+alignedBull = biasBull and trendBull
+alignedBear = biasBear and trendBear
+opposedBull = biasBull and trendBear
+opposedBear = biasBear and trendBull
+
+// 2) Execution TF rule from prompt:
+//    - if 1H aligns with 4H => execute from 5m BOS
+//    - if 1H opposes 4H => execute from 15m BOS
+execTF = (alignedBull or alignedBear) ? "5" : (opposedBull or opposedBear) ? "15" : "15"
+[bosUpExec, bosDnExec] = request.security(syminfo.tickerid, execTF, f_bos(leftRight))
+
+// 3) Sweep on 1H or 4H
+useSweepTF = autoSweepTF ? ((alignedBull or alignedBear) ? "60" : "240") : (manualSweepTF == "1H" ? "60" : "240")
+[sweepPH, sweepPL] = f_last_confirmed_pivot_levels(useSweepTF, leftRight)
+sH = request.security(syminfo.tickerid, useSweepTF, high)
+sL = request.security(syminfo.tickerid, useSweepTF, low)
+sC = request.security(syminfo.tickerid, useSweepTF, close)
+sweepHigh = not na(sweepPH) and sH > sweepPH and sC < sweepPH
+sweepLow  = not na(sweepPL) and sL < sweepPL and sC > sweepPL
+sweepOkBull = requireSweep ? sweepLow  : true
+sweepOkBear = requireSweep ? sweepHigh : true
+
+// Structure on chart TF (used to define zones)
+ph = ta.pivothigh(high, leftRight, leftRight)
+pl = ta.pivotlow(low,  leftRight, leftRight)
+lastPH = ta.valuewhen(not na(ph), ph, 0)
+lastPL = ta.valuewhen(not na(pl), pl, 0)
+bosUpChart = not na(lastPH) and close > lastPH
+bosDnChart = not na(lastPL) and close < lastPL
+
+// 4) Confluence zones (OB/FVG/Breaker/EQ)
+var float obHi = na
+var float obLo = na
+var int   obDir = 0
+var box   obBox = na
+
+var float lastBullOBHi = na
+var float lastBullOBLo = na
+var float lastBearOBHi = na
+var float lastBearOBLo = na
+
+if bosUpChart
+    i = f_find_last_bearish_candle()
+    if not na(i)
+        obHi := high[i]
+        obLo := low[i]
+        obDir := +1
+        lastBullOBHi := obHi
+        lastBullOBLo := obLo
+
+if bosDnChart
+    i = f_find_last_bullish_candle()
+    if not na(i)
+        obHi := high[i]
+        obLo := low[i]
+        obDir := -1
+        lastBearOBHi := obHi
+        lastBearOBLo := obLo
+
+inOB = obDir != 0 and close <= obHi and close >= obLo
+hitOB = useOBTouch ? inOB : false
+
+if showOBBoxes and obDir != 0
+    if not na(obBox)
+        box.delete(obBox)
+    obBox := box.new(bar_index - 1, obHi, bar_index, obLo, extend=extend.right,
+      border_width=1, border_color=color.new(color.white, 0), bgcolor=color.new(color.blue, 75))
+
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+var float fvgHi = na
+var float fvgLo = na
+var int   fvgDir = 0
+var box   fvgBox = na
+
+if bullFVG
+    fvgHi := low
+    fvgLo := high[2]
+    fvgDir := +1
+
+if bearFVG
+    fvgHi := low[2]
+    fvgLo := high
+    fvgDir := -1
+
+inFVG = fvgDir != 0 and close <= fvgHi and close >= fvgLo
+hitFVG = useFVGTouch ? inFVG : false
+
+if showFVGBoxes and fvgDir != 0
+    if not na(fvgBox)
+        box.delete(fvgBox)
+    fvgBox := box.new(bar_index - 1, fvgHi, bar_index, fvgLo, extend=extend.right,
+      border_width=1, border_color=color.new(color.white, 0), bgcolor=color.new(color.purple, 80))
+
+// Breaker proxy: failed opposite OB that gets violated then retested
+var float brkHi = na
+var float brkLo = na
+var int   brkDir = 0
+var box   brkBox = na
+
+if not na(lastBearOBHi) and close > lastBearOBHi
+    brkHi := lastBearOBHi
+    brkLo := lastBearOBLo
+    brkDir := +1
+
+if not na(lastBullOBLo) and close < lastBullOBLo
+    brkHi := lastBullOBHi
+    brkLo := lastBullOBLo
+    brkDir := -1
+
+inBreaker = brkDir != 0 and close <= brkHi and close >= brkLo
+hitBreaker = useBreakerTouch ? inBreaker : false
+
+if showBreakerBoxes and brkDir != 0
+    if not na(brkBox)
+        box.delete(brkBox)
+    brkBox := box.new(bar_index - 1, brkHi, bar_index, brkLo, extend=extend.right,
+      border_width=1, border_color=color.new(color.orange, 0), bgcolor=color.new(color.orange, 80))
+
+swingHigh = ta.valuewhen(not na(ta.pivothigh(high, leftRight, leftRight)), ta.pivothigh(high, leftRight, leftRight), 0)
+swingLow  = ta.valuewhen(not na(ta.pivotlow(low,  leftRight, leftRight)),  ta.pivotlow(low,  leftRight, leftRight),  0)
+eqMid = (swingHigh + swingLow) / 2.0
+eqTol = 10 * syminfo.mintick
+hitEQ = useEQTouch ? (not na(eqMid) and math.abs(close - eqMid) <= eqTol) : false
+
+hit3rdConfluence = (hitOB or hitFVG or hitBreaker or hitEQ)
+
+// 5) Pressure confirmation
+rng = math.max(high - low, syminfo.mintick)
+bodyPct = math.abs(close - open) / rng
+volOk = volume > ta.sma(volume, pressureVolLen)
+buyPressure  = close > open and close > close[1] and bodyPct >= pressureBodyPct and volOk
+sellPressure = close < open and close < close[1] and bodyPct >= pressureBodyPct and volOk
+
+// 6) Entry gates
+longGate  = (alignedBull or opposedBull) and sweepOkBull and bosUpExec and hit3rdConfluence
+shortGate = (alignedBear or opposedBear) and sweepOkBear and bosDnExec and hit3rdConfluence
+
+longEntry  = longGate and buyPressure
+shortEntry = shortGate and sellPressure
+
+// Risk model
+fallbackSL_Long  = swingLow
+fallbackSL_Short = swingHigh
+
+longSL  = (obDir == +1 and not na(obLo)) ? obLo : fallbackSL_Long
+shortSL = (obDir == -1 and not na(obHi)) ? obHi : fallbackSL_Short
+
+longRisk  = close - longSL
+shortRisk = shortSL - close
+
+validLong  = (not na(longSL))  and longRisk  > syminfo.mintick * 5
+validShort = (not na(shortSL)) and shortRisk > syminfo.mintick * 5
+
+longTP  = close + (longRisk  * rr)
+shortTP = close - (shortRisk * rr)
+
+if longEntry and validLong and strategy.position_size == 0
+    strategy.entry("L", strategy.long)
+    strategy.exit("L-Exit", "L", stop=longSL, limit=longTP)
+
+if shortEntry and validShort and strategy.position_size == 0
+    strategy.entry("S", strategy.short)
+    strategy.exit("S-Exit", "S", stop=shortSL, limit=shortTP)
+
+plot(eqMid, "Equilibrium (mid)", color=color.new(color.yellow, 0))
+plotshape(showLabels and longEntry,  title="Long Entry",  style=shape.triangleup,   location=location.belowbar, size=size.tiny, text="L")
+plotshape(showLabels and shortEntry, title="Short Entry", style=shape.triangledown, location=location.abovebar, size=size.tiny, text="S")
+
+if showLabels and (longEntry or shortEntry)
+    dir = longEntry ? "LONG" : "SHORT"
+    confTxt = hitOB ? "OB" : hitFVG ? "FVG" : hitBreaker ? "BRK" : "EQ"
+    txt = dir + "\n3rd: " + confTxt + "\nExec TF: " + execTF + "\nSweep TF: " + useSweepTF
+    label.new(bar_index, longEntry ? low : high, txt, style=label.style_label_left,
+      textcolor=color.white, color=color.new(color.black, 0))
+
+var table t = table.new(position.top_right, 1, 1)
+status = "Bias(4H): " + (biasBull ? "Bull" : biasBear ? "Bear" : "Flat") +
+         "\nTrend(1H): " + (trendBull ? "Bull" : trendBear ? "Bear" : "Flat") +
+         "\nAligned: " + ((alignedBull or alignedBear) ? "YES" : "NO") +
+         "\nOpposed: " + ((opposedBull or opposedBear) ? "YES" : "NO") +
+         "\nExec TF: " + execTF +
+         "\nSweep TF: " + useSweepTF +
+         "\nSweep OK: " + ((biasBull ? sweepOkBull : biasBear ? sweepOkBear : false) ? "YES" : "NO") +
+         "\nBOS OK: " + ((biasBull ? bosUpExec : biasBear ? bosDnExec : false) ? "YES" : "NO") +
+         "\n3rd hit: " + (hit3rdConfluence ? "YES" : "NO") +
+         "\nPressure: " + ((buyPressure or sellPressure) ? "YES" : "NO")
+table.cell(t, 0, 0, status)
